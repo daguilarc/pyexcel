@@ -1,0 +1,5 @@
+# Full excelpy stack (both tools). For isolated installs, use:
+#   requirements-isolation-forest.txt
+#   requirements-tabpfn-forecast.txt
+-r requirements-isolation-forest.txt
+-r requirements-tabpfn-forecast.txt

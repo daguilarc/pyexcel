@@ -1,0 +1,13 @@
+# TabPFN forecast tool only (pip install -r requirements-tabpfn-forecast.txt)
+xlwings>=0.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+scipy>=1.10.0
+openpyxl>=3.1.0
+statsmodels>=0.14.0
+tabpfn>=0.1.0
+huggingface_hub>=0.20.0
+# Optional: Bayesian MCMC mode
+# bambi>=0.13.0
+# pymc>=5.0.0
