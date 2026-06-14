@@ -113,18 +113,11 @@ Both scripts keep helpers **inline at the top of each file** (arg parsing, array
 
 ## Dependencies
 
-| File | Use when |
-|------|----------|
-| [`requirements-base.txt`](requirements-base.txt) | Shared xlwings / pandas / sklearn stack (included by the files below) |
-| [`requirements-isolation-forest.txt`](requirements-isolation-forest.txt) | Anomaly detection only |
-| [`requirements-tabpfn-forecast.txt`](requirements-tabpfn-forecast.txt) | Forecast macro only |
-| [`requirements.txt`](requirements.txt) | Both tools (includes the two per-tool files above) |
+[`requirements.txt`](requirements.txt) — xlwings, pandas, sklearn, and TabPFN forecast packages for both tools.
 
-Conda: [`environment.yml`](environment.yml) installs `requirements-base.txt` via pip (add forecast deps with `pip install -r requirements-tabpfn-forecast.txt` if needed).
+Conda: [`environment.yml`](environment.yml) installs the same list via pip.
 
 ```bash
-pip install -r requirements-isolation-forest.txt
-pip install -r requirements-tabpfn-forecast.txt
 pip install -r requirements.txt
 ```
 
@@ -366,7 +359,7 @@ python isolation_forest.py "My Reports/data.xlsx" --sheet "Raw Input" --ascendin
 
 | Issue | Fix |
 |-------|-----|
-| Import / sklearn errors | `pip install -r requirements-isolation-forest.txt` |
+| Import / sklearn errors | `pip install -r requirements.txt` |
 | `#ERROR` in cell | ≥2 valid rows; matching feature counts; valid parameter ranges |
 | Function unknown | xlwings → Import Functions → `isolation_forest.py` |
 | CLI “no data” | Headers row 1; numeric columns present |
@@ -406,7 +399,7 @@ python tabpfn_forecast.py <workbook.xlsx>
 
 No CLI flags — settings come from `ForecastSettings.xlsx` next to `tabpfn_forecast.py` (not next to the data workbook).
 
-**Deps:** `pip install -r requirements-tabpfn-forecast.txt` (TabPFN may need Hugging Face auth; falls back to GradientBoosting).
+**Deps:** `pip install -r requirements.txt` (TabPFN may need Hugging Face auth; falls back to GradientBoosting).
 
 ---
 
@@ -426,10 +419,7 @@ No CLI flags — settings come from `ForecastSettings.xlsx` next to `tabpfn_fore
 ```
 excelpy/
 ├── README.md
-├── requirements-base.txt
 ├── requirements.txt
-├── requirements-isolation-forest.txt
-├── requirements-tabpfn-forecast.txt
 ├── environment.yml
 ├── isolation_forest.py
 ├── tabpfn_forecast.py

@@ -1,8 +1,0 @@
-# TabPFN forecast tool only (pip install -r requirements-tabpfn-forecast.txt)
--r requirements-base.txt
-statsmodels>=0.14.0
-tabpfn>=0.1.0
-huggingface_hub>=0.20.0
-# Optional: Bayesian MCMC mode
-# bambi>=0.13.0
-# pymc>=5.0.0

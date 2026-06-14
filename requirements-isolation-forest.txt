@@ -1,2 +1,0 @@
-# Isolation Forest Excel UDF only (pip install -r requirements-isolation-forest.txt)
--r requirements-base.txt
