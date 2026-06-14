@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 ~$*
 *.xlsx
+*.csv
 miniconda/
 .venv/
 venv/
