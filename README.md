@@ -115,11 +115,12 @@ Both scripts keep helpers **inline at the top of each file** (arg parsing, array
 
 | File | Use when |
 |------|----------|
+| [`requirements-base.txt`](requirements-base.txt) | Shared xlwings / pandas / sklearn stack (included by the files below) |
 | [`requirements-isolation-forest.txt`](requirements-isolation-forest.txt) | Anomaly detection only |
 | [`requirements-tabpfn-forecast.txt`](requirements-tabpfn-forecast.txt) | Forecast macro only |
-| [`requirements.txt`](requirements.txt) | Both (includes the two files above) |
+| [`requirements.txt`](requirements.txt) | Both tools (includes the two per-tool files above) |
 
-Conda: [`environment.yml`](environment.yml) (base stack; add TabPFN via pip if needed).
+Conda: [`environment.yml`](environment.yml) installs `requirements-base.txt` via pip (add forecast deps with `pip install -r requirements-tabpfn-forecast.txt` if needed).
 
 ```bash
 pip install -r requirements-isolation-forest.txt
@@ -425,6 +426,7 @@ No CLI flags — settings come from `ForecastSettings.xlsx` next to `tabpfn_fore
 ```
 excelpy/
 ├── README.md
+├── requirements-base.txt
 ├── requirements.txt
 ├── requirements-isolation-forest.txt
 ├── requirements-tabpfn-forecast.txt
