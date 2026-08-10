@@ -1,34 +1,23 @@
 #!/usr/bin/env python3
 """
-Isolation Forest Anomaly Detection - Excel UDF Tool
+Isolation Forest Anomaly Detection
 
-Excel formulas:
-- =ISOLATION_FOREST(...) - returns continuous anomaly scores (optional: ascending, epsilon)
-- =ANOMALY_BINARY(...) - returns binary 0/1 predictions (with optional Bayesian sequential updating)
+Two entry points, both routed through run_isolation_forest_configured():
+- run_isolation_forest() - macro entry point, invoked from VBA via RunPython
+- main()                 - CLI entry point (python isolation_forest.py <workbook.xlsx> [flags])
 
-Workflow:
-1. Run Isolation Forest on the provided data
-2. Score the same data points for anomaly detection
-3. Output variable array of scores/predictions
-
-Monte Carlo Resampling:
-- Uses stationary bootstrap (Politis & Romano, 1994) when sample size >= expected block length
-- Falls back to i.i.d. bootstrap for small samples (< expected block length)
-- Preserves time structure better than i.i.d. bootstrap for time series data
-- Expected block length = 1/p (default p=0.1 gives threshold=10)
-
-Uses xlwings UDF wrapper - no Settings sheet required.
+See README.md for configuration details (PyexcelSettings.xlsx, 'IsolationForest' sheet).
 """
 
 import xlwings as xw  # type: ignore
 import pandas as pd
 import numpy as np
 import sys
+import os
 import argparse
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Tuple
 from sklearn.ensemble import IsolationForest
-from scipy.stats import beta
 
 
 # =============================================================================
@@ -38,84 +27,32 @@ from scipy.stats import beta
 # Constants
 RANDOM_SEED = 42  # Base seed for reproducibility
 
-BOOL_SLOTS_ISOLATION = ('epsilon', 'ascending', 'binary', 'bayes_freq')
-BOOL_SLOTS_ANOMALY = ('bayes_freq',)
+SETTINGS_FILENAME = 'PyexcelSettings.xlsx'
+SETTINGS_SHEET_NAME = 'IsolationForest'
 
+# Single source of truth for every settings key: (key, cli flags, settings-sheet
+# label, value kind, built-in default). Drives read_settings, create_default_settings,
+# the macro entry's cfg dict, and the CLI's argparse setup + precedence resolution.
+SETTINGS_SCHEMA = [
+    ('sheets', ('--sheets', '--sheet'), 'Data Sheets (comma-separated)', 'list', []),
+    ('contamination', ('--contamination',), 'Contamination', 'float', 0.1),
+    ('monte_carlo_samples', ('--monte-carlo-samples',), 'Monte Carlo Samples', 'int', 0),
+    ('ascending', ('--ascending',), 'Ascending', 'bool', False),
+    ('epsilon', ('--epsilon',), 'Epsilon', 'bool', False),
+    ('cumulative', ('--cumulative',), 'Cumulative Sheets', 'bool', False),
+    ('output_sheet', ('--output-sheet',), 'Output Sheet', 'str', 'AnomalyScores'),
+]
 
-def _is_contamination_value(arg: float) -> bool:
-    return 0 < arg <= 0.5
-
-
-def _is_mc_samples_value(arg: float) -> bool:
-    return arg == 0 or (100 <= arg <= 10000)
-
-
-def _is_array_index_value(arg: float) -> bool:
-    return arg >= 0 and not _is_contamination_value(arg) and not _is_mc_samples_value(arg)
-
-
-def _parse_udf_args(
-    args: tuple,
-    bool_slot_names: Tuple[str, ...],
-) -> Tuple[List, Dict[str, bool], Optional[float], int, int]:
-    """
-    Parse Excel UDF *args: data arrays first, then optional params by type.
-    Booleans use None sentinels so FALSE advances to the next slot correctly.
-    """
-    data_arrays: List = []
-    bools: Dict[str, Optional[bool]] = {name: None for name in bool_slot_names}
-    contamination: Optional[float] = None
-    monte_carlo_samples: Optional[int] = None
-    array_index: Optional[int] = None
-
-    for arg in args:
-        if isinstance(arg, bool):
-            for name in bool_slot_names:
-                if bools[name] is None:
-                    bools[name] = arg
-                    break
-        elif isinstance(arg, (int, float)):
-            if contamination is None and _is_contamination_value(arg):
-                contamination = float(arg)
-            elif monte_carlo_samples is None and _is_mc_samples_value(arg):
-                monte_carlo_samples = int(arg)
-            elif array_index is None and _is_array_index_value(arg):
-                array_index = int(arg)
-        else:
-            data_arrays.append(arg)
-
-    resolved_bools = {name: (bools[name] if bools[name] is not None else False) for name in bool_slot_names}
-    return (
-        data_arrays,
-        resolved_bools,
-        contamination,
-        monte_carlo_samples if monte_carlo_samples is not None else 0,
-        array_index if array_index is not None else 0,
-    )
-
-
-def _arrays_to_numpy(data_arrays: List) -> Tuple[List[np.ndarray], List[int], np.ndarray, np.ndarray]:
-    arrays: List[np.ndarray] = []
-    array_sizes: List[int] = []
-    for arr in data_arrays:
-        arr_np = np.asarray(arr, dtype=np.float64)
-        if arr_np.ndim == 1:
-            arr_np = arr_np.reshape(1, -1)
-        elif arr_np.ndim != 2:
-            raise ValueError("Data arrays must be 1D or 2D")
-        arrays.append(arr_np)
-        array_sizes.append(arr_np.shape[0])
-
-    n_cols = arrays[0].shape[1]
-    for i, arr in enumerate(arrays[1:], 1):
-        if arr.shape[1] != n_cols:
-            raise ValueError(
-                f"All arrays must have same number of columns. Array 1: {n_cols}, Array {i+1}: {arr.shape[1]}"
-            )
-
-    X = np.vstack(arrays) if len(arrays) > 1 else arrays[0]
-    valid_mask = ~np.isnan(X).any(axis=1)
-    return arrays, array_sizes, X, valid_mask
+# CLI help text per key (falls back to a generated string from the label if absent).
+_SETTINGS_HELP = {
+    'sheets': 'Comma-separated sheet names to process (default: first sheet)',
+    'contamination': 'Expected proportion of anomalies (default: 0.1)',
+    'monte_carlo_samples': 'Monte Carlo resampling iterations (0=off, 100-10000)',
+    'ascending': 'Use ascending scores (high score = highly anomalous)',
+    'epsilon': 'Shift scores to ensure all values > 0 (requires --ascending)',
+    'cumulative': 'Score sheets cumulatively (sheet k fit on sheets 1..k, no lookahead)',
+    'output_sheet': 'Output sheet name (default: AnomalyScores)',
+}
 
 
 def _apply_score_transforms(scores: np.ndarray, ascending: bool, epsilon: bool) -> np.ndarray:
@@ -142,206 +79,73 @@ def _fit_score_array(
     monte_carlo_samples: int,
     X_cumulative: np.ndarray,
 ) -> np.ndarray:
-    model = IsolationForest(contamination=contamination, random_state=RANDOM_SEED)
-    model.fit(X_cumulative)
+    # Only fit the IsolationForest when it will actually be used for scoring;
+    # on the Monte Carlo path the fitted model is discarded unused.
     if monte_carlo_samples > 0:
         return monte_carlo_score_samples(arr_clean, contamination, monte_carlo_samples)
+    model = IsolationForest(contamination=contamination, random_state=RANDOM_SEED)
+    model.fit(X_cumulative)
     return model.score_samples(arr_clean)
 
 
-def _bayesian_cumulative_binary(
+def _score_sheets_cumulative(
     arrays: List[np.ndarray],
-    array_sizes: List[int],
-    prior_contamination: float,
+    contamination: float,
     monte_carlo_samples: int,
     ascending: bool,
     epsilon: bool,
-    n_arrays: int,
-) -> Tuple[List[np.ndarray], np.ndarray]:
-    alpha = prior_contamination * 100
-    beta_param = (1 - prior_contamination) * 100
-    all_binary: List[np.ndarray] = []
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """
+    Sequential per-sheet scoring with no lookahead: sheet k is scored against a
+    model fit on sheets 1..k (cumulative), with contamination held constant
+    across all sheets. Returns (scores_per_sheet, binary_per_sheet).
+    """
+    scores_per_sheet: List[np.ndarray] = []
+    binary_per_sheet: List[np.ndarray] = []
     cumulative_arrays: List[np.ndarray] = []
 
-    for arr_idx, arr in enumerate(arrays):
+    for arr in arrays:
         arr_valid_mask = ~np.isnan(arr).any(axis=1)
         arr_clean = arr[arr_valid_mask]
 
         if len(arr_clean) < 2:
-            all_binary.append(np.full(array_sizes[arr_idx], np.nan))
+            scores_per_sheet.append(np.full(len(arr), np.nan))
+            binary_per_sheet.append(np.full(len(arr), np.nan))
             continue
 
         cumulative_arrays.append(arr_clean)
-        current_contamination = min(beta.mean(alpha, beta_param), 0.5)
         X_cumulative = np.vstack(cumulative_arrays) if len(cumulative_arrays) > 1 else cumulative_arrays[0]
 
-        arr_scores = _fit_score_array(arr_clean, current_contamination, monte_carlo_samples, X_cumulative)
+        arr_scores = _fit_score_array(arr_clean, contamination, monte_carlo_samples, X_cumulative)
         arr_scores = _apply_score_transforms(arr_scores, ascending, epsilon)
-        arr_binary = _scores_to_binary(arr_scores, current_contamination, ascending)
+        arr_binary = _scores_to_binary(arr_scores, contamination, ascending)
 
-        if arr_idx < n_arrays - 1:
-            alpha += np.sum(arr_binary)
-            beta_param += len(arr_clean) - np.sum(arr_binary)
+        score_result = np.full(len(arr), np.nan)
+        score_result[arr_valid_mask] = arr_scores
+        binary_result = np.full(len(arr), np.nan)
+        binary_result[arr_valid_mask] = arr_binary
 
-        arr_result = np.full(array_sizes[arr_idx], np.nan)
-        arr_result[arr_valid_mask] = arr_binary
-        all_binary.append(arr_result)
+        scores_per_sheet.append(score_result)
+        binary_per_sheet.append(binary_result)
 
-    return all_binary, np.concatenate(all_binary)
-
-
-def _bayesian_cumulative_predictions(
-    arrays: List[np.ndarray],
-    array_sizes: List[int],
-    prior_contamination: float,
-    monte_carlo_samples: int,
-    n_arrays: int,
-) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray]:
-    """ANOMALY_BINARY Bayesian mode: descending scores only (no ascending/epsilon)."""
-    alpha = prior_contamination * 100
-    beta_param = (1 - prior_contamination) * 100
-    all_predictions: List[np.ndarray] = []
-    all_valid_masks: List[np.ndarray] = []
-    cumulative_arrays: List[np.ndarray] = []
-
-    for arr_idx, arr in enumerate(arrays):
-        arr_valid_mask = ~np.isnan(arr).any(axis=1)
-        arr_clean = arr[arr_valid_mask]
-
-        if len(arr_clean) < 2:
-            all_predictions.append(np.full(array_sizes[arr_idx], np.nan))
-            all_valid_masks.append(arr_valid_mask)
-            continue
-
-        cumulative_arrays.append(arr_clean)
-        current_contamination = min(beta.mean(alpha, beta_param), 0.5)
-        X_cumulative = np.vstack(cumulative_arrays) if len(cumulative_arrays) > 1 else cumulative_arrays[0]
-
-        scores = _fit_score_array(arr_clean, current_contamination, monte_carlo_samples, X_cumulative)
-        arr_binary = (scores <= np.percentile(scores, current_contamination * 100)).astype(int)
-
-        if arr_idx < n_arrays - 1:
-            alpha += np.sum(arr_binary)
-            beta_param += len(arr_clean) - np.sum(arr_binary)
-
-        arr_result = np.full(array_sizes[arr_idx], np.nan)
-        arr_result[arr_valid_mask] = arr_binary
-        all_predictions.append(arr_result)
-        all_valid_masks.append(arr_valid_mask)
-
-    return all_predictions, all_valid_masks, np.concatenate(all_predictions)
-
-
-def _build_array_column(
-    arr_size: int,
-    arr_valid_mask: np.ndarray,
-    source: np.ndarray,
-    source_start: int,
-    source_count: int,
-    pad_to: int,
-) -> np.ndarray:
-    col = np.full(arr_size, np.nan)
-    col[arr_valid_mask] = source[source_start:source_start + source_count]
-    if arr_size < pad_to:
-        col = np.pad(col, (0, pad_to - arr_size), constant_values=np.nan)
-    return col
-
-
-def _build_excel_output(
-    array_sizes: List[int],
-    valid_mask: np.ndarray,
-    scores: np.ndarray,
-    n_arrays: int,
-    input_single_row: bool,
-    array_index: int,
-    binary: bool,
-    binary_predictions: Optional[np.ndarray],
-    all_binary: Optional[List[np.ndarray]],
-    bayes_freq: bool,
-) -> Union[float, List, List[List]]:
-    if input_single_row:
-        if binary and binary_predictions is not None:
-            return [float(scores[0]), int(binary_predictions[0])]
-        return float(scores[0])
-
-    if n_arrays == 1:
-        if binary and binary_predictions is not None:
-            return np.column_stack([scores, binary_predictions]).tolist()
-        return scores.reshape(-1, 1).tolist()
-
-    array_cumsum = np.cumsum([0] + array_sizes)
-    valid_cumsum = np.concatenate([[0], np.cumsum(valid_mask)])
-    max_rows = max(array_sizes)
-
-    if array_index > 0:
-        target_idx = array_index - 1
-        array_start_idx = array_cumsum[target_idx]
-        arr_size = array_sizes[target_idx]
-        arr_valid_mask = valid_mask[array_start_idx:array_start_idx + arr_size]
-        arr_valid_count = int(np.sum(arr_valid_mask))
-        score_idx = valid_cumsum[array_start_idx]
-
-        arr_score = np.full(arr_size, np.nan)
-        arr_score[arr_valid_mask] = scores[score_idx:score_idx + arr_valid_count]
-
-        if binary and binary_predictions is not None:
-            if bayes_freq and all_binary is not None:
-                arr_binary = all_binary[target_idx]
-            else:
-                arr_binary = np.full(arr_size, np.nan)
-                arr_binary[arr_valid_mask] = binary_predictions[score_idx:score_idx + arr_valid_count]
-            return np.column_stack([arr_score, arr_binary]).tolist()
-        return arr_score.reshape(-1, 1).tolist()
-
-    columns: List[np.ndarray] = []
-    for arr_idx, arr_size in enumerate(array_sizes):
-        array_start_idx = array_cumsum[arr_idx]
-        arr_valid_mask = valid_mask[array_start_idx:array_start_idx + arr_size]
-        arr_valid_count = int(np.sum(arr_valid_mask))
-        score_idx = valid_cumsum[array_start_idx]
-
-        arr_score = _build_array_column(
-            arr_size, arr_valid_mask, scores, score_idx, arr_valid_count, max_rows
-        )
-
-        if binary and binary_predictions is not None:
-            if bayes_freq and all_binary is not None:
-                arr_binary = all_binary[arr_idx]
-                if arr_size < max_rows:
-                    arr_binary = np.pad(arr_binary, (0, max_rows - arr_size), constant_values=np.nan)
-            else:
-                arr_binary = _build_array_column(
-                    arr_size, arr_valid_mask, binary_predictions, score_idx, arr_valid_count, max_rows
-                )
-            columns.append(arr_score)
-            columns.append(arr_binary)
-        else:
-            columns.append(arr_score)
-
-    return np.array(columns).T.tolist()
+    return scores_per_sheet, binary_per_sheet
 
 
 def monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples, stationary_bootstrap_p=0.1):
     """
     Monte Carlo resampling for Isolation Forest scoring.
     Uses stationary bootstrap (Politis & Romano, 1994) with fallback to i.i.d. bootstrap for small samples.
-    
-    Stationary bootstrap algorithm:
-    - Starts at random position
-    - With probability p, continues to next observation (wraps around at end)
-    - With probability (1-p), jumps to random position
-    - Expected block length = 1/p (default p=0.1 gives expected block length of 10)
-    - Preserves time structure better than i.i.d. bootstrap for time series data
-    - Falls back to i.i.d. bootstrap if sample size < expected block length (1/p)
-    
+
+    Stationary bootstrap: starts at a random position; with probability p continues to the
+    next observation (wraps around), with probability (1-p) jumps to a random position.
+    Expected block length = 1/p. Falls back to i.i.d. bootstrap if sample size < 1/p.
+
     Args:
         X_clean: Clean data array (no NaN rows)
         contamination: Contamination rate (0-0.5)
         monte_carlo_samples: Number of Monte Carlo iterations (100-10000)
         stationary_bootstrap_p: Probability parameter for stationary bootstrap (default 0.1)
-            Controls expected block length = 1/p. Lower p = longer blocks.
-            If sample size < 1/p, falls back to i.i.d. bootstrap.
-    
+
     Returns:
         Aggregated scores (mean across all Monte Carlo iterations)
     """
@@ -349,23 +153,23 @@ def monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples, stati
     start_time = time.time()
     n_samples = len(X_clean)
     scores_buf = np.empty((monte_carlo_samples, n_samples), dtype=np.float64)
-    
+
     # Calculate minimum sample threshold from expected block length
     expected_block_length = 1.0 / stationary_bootstrap_p
     min_samples_threshold = int(np.ceil(expected_block_length))
-    
+
     # Use i.i.d. bootstrap if sample size is too small for stationary bootstrap
     use_stationary = n_samples >= min_samples_threshold
-    
+
     # Create seed sequence for proper parallelization support
     child_ss = np.random.SeedSequence(RANDOM_SEED).spawn(monte_carlo_samples)
-    
+
     # Pre-allocate indices array for stationary bootstrap (O(1) optimization)
     indices = np.empty(n_samples, dtype=np.int64) if use_stationary else None
-    
+
     for sample in range(monte_carlo_samples):
         rng = np.random.default_rng(child_ss[sample])
-        
+
         # Generate bootstrap indices
         if use_stationary:
             # Stationary bootstrap algorithm (Politis & Romano, 1994)
@@ -381,10 +185,10 @@ def monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples, stati
         else:
             # i.i.d. bootstrap fallback for small samples
             X_boot = X_clean[rng.integers(0, n_samples, size=n_samples)]
-        
+
         scores_buf[sample] = IsolationForest(
             contamination=contamination,
-            random_state=rng.integers(0, 2**42)
+            random_state=rng.integers(0, 2**32)
         ).fit(X_boot).score_samples(X_clean)
 
         sleep_time = (sample + 1) * throttle_interval - (time.time() - start_time)
@@ -395,356 +199,272 @@ def monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples, stati
 
 
 # =============================================================================
-# EXCEL UDF FORMULA (use as: =ISOLATION_FOREST(...))
+# SETTINGS
 # =============================================================================
 
-@xw.func
-def ISOLATION_FOREST(
-    *args
-) -> Union[float, List[List]]:
-    """
-    Excel UDF for Isolation Forest anomaly scoring - returns one score per data point.
-    
-    Isolation Forest is an unsupervised algorithm that detects anomalies by learning patterns
-    from the data itself. It trains on the provided data and scores each data point for anomaly detection.
-    
-    Parameters (in order):
-        *args: Input data arrays followed by optional parameters in this specific order:
-              - One or more data arrays (rows x columns format)
-              - Each row = one data point, each column = one feature
-              - Multiple arrays are combined (all must have same number of columns)
-              
-              Optional parameters (can be specified in any order after data arrays):
-              Parameters are identified by type/pattern, so you can specify them in any order.
-              - contamination: 0-0.5 decimal (e.g., 0.1 for 10%)
-              - monte_carlo_samples: 0 or 100-10000 integer
-              - ascending: TRUE/FALSE boolean
-              - epsilon: TRUE/FALSE boolean (requires ascending=TRUE)
-              - binary: TRUE/FALSE boolean (adds binary column next to scores)
-              - bayes_freq: TRUE/FALSE boolean (only used when binary=TRUE, enables Bayesian updating)
-              - array_index: 0 or 1-indexed integer (for multiple arrays)
-              
-              - contamination: Expected proportion of anomalies as decimal (0-0.5)
-                     Default: 0.1 (10%)
-                     Examples: 0.05 = 5%, 0.1 = 10%, 0.5 = 50% (max)
-                     Maximum is 0.5 (50%) based on the fundamental assumption of Isolation Forest
-                     (Liu et al., 2008) that anomalies are "few and different" - they should be
-                     a minority of the data. Beyond 0.5, the distinction between "normal" and
-                     "anomalous" becomes meaningless, as you'd be assuming more than half your
-                     data is anomalous, which contradicts the algorithm's core premise.
-                     Reference: Liu, F. T., Ting, K. M., & Zhou, Z.-H. (2008). Isolation Forest.
-                     In 2008 Eighth IEEE International Conference on Data Mining (pp. 413-422).
-              - monte_carlo_samples: Number of Monte Carlo resampling iterations (0 or 100-10000)
-                     Default: 0 (off)
-                     Must be 0 (disabled) or between 100-10000
-                     Throttled to 100 samples per 0.5 seconds - only change if your computer can handle it
-              - ascending: Boolean, if TRUE scores are ascending (high score = highly anomalous)
-                     Default: FALSE (descending: lower score = more anomalous)
-              - epsilon: Boolean, if TRUE shifts scores using 0.1th percentile threshold to ensure all values > 0
-                     Default: FALSE
-                     Only works when ascending=TRUE (requires ascending to be enabled)
-                     This is for gamma distribution modeling of the scores (gamma GLM requires strictly positive values)
-                     Uses 0.1th percentile as shift threshold (robust to outliers) with epsilon to guarantee positivity
-              - binary: Boolean, if TRUE adds binary column (0/1) next to scores
-                     Default: FALSE (scores only)
-                     When TRUE: Returns 2 columns per array (score, binary)
-                     Binary uses percentile threshold from contamination rate
-              - bayes_freq: Boolean, if TRUE uses Bayesian updating for binary column (only when binary=TRUE)
-                     Default: FALSE (frequentist binary from main scores)
-                     TRUE: Fits models cumulatively (arrays 1, then 1+2, then 1+2+3, etc.) for binary
-                     Scores each array separately but fits on cumulative data
-                     Updates contamination using Beta-Binomial conjugate prior
-                     Only works with multiple arrays
-                     
-                     IMPORTANT LIMITATION: The procedure updates a Beta prior using counts that are
-                     defined by the parameter being updated (threshold = posterior mean percentile),
-                     so the posterior reflects the stability of the cutoff, not evidence about the
-                     true population anomaly rate. This is a self-consistency measure, not Bayesian
-                     inference about an unknown parameter from independent observations.
-              - array_index: Integer, 1-indexed array number to return (0 = return all arrays)
-                     Default: 0 (return all columns)
-                     Examples: 1 = first array only, 2 = second array only
-                     Only works with multiple arrays. Returns error if index exceeds number of arrays.
-    
-    Returns:
-        Anomaly scores (by default descending: lower = more anomalous, unless ascending=TRUE):
-        - Single value if input is single row (1 data point), or [score, binary] if binary=TRUE
-        - Column array (n_rows x 1) if single array input, or (n_rows x 2) if binary=TRUE
-        - Multiple columns (one per input array) if multiple arrays, or (n_arrays × 2) if binary=TRUE
-        When binary=TRUE: Columns are interleaved (score1, binary1, score2, binary2, ...)
-    
-    Usage (parameters can be in any order after data arrays):
-        =ISOLATION_FOREST(A2:E100)  # Single array (default 10% contamination)
-        =ISOLATION_FOREST(A2:E100, 0.05)  # 5% contamination
-        =ISOLATION_FOREST(A2:E100, 1000)  # 1000 Monte Carlo samples (contamination=default)
-        =ISOLATION_FOREST(A2:E100, TRUE)  # ascending=TRUE (contamination=default)
-        =ISOLATION_FOREST(A2:E100, 0.05, 1000)  # 5% contamination + 1000 Monte Carlo samples
-        =ISOLATION_FOREST(A2:E100, 1000, 0.05)  # Same as above (order doesn't matter)
-        =ISOLATION_FOREST(A2:E100, 0.05, 1000, TRUE, TRUE)  # All params in any order
-        =ISOLATION_FOREST(A2:E50, G2:J50)  # Multiple arrays (combined)
-        =ISOLATION_FOREST(A2:E50, G2:J50, 2)  # Multiple arrays, return only 2nd array
-        =ISOLATION_FOREST(A2:E50, G2:J50, 0.1, TRUE, 2)  # Multiple arrays with params in any order
-    
-    Note: All input arrays must have the same number of columns (features).
-          Contamination must be between 0 and 0.5 (exclusive of 0, inclusive of 0.5).
-          Monte Carlo samples must be 0 (off) or between 100-10000 (no values like 3 allowed).
-          
-    Practical Limits:
-    - Excel formula length: Maximum 8,192 characters (theoretical limit ~700-1000 arrays)
-    - Memory: All arrays are loaded and combined upfront (O(n) memory where n = total rows).
-              Memory usage ≈ total_rows × features × 8 bytes × 2 (data + scores arrays + overhead).
-              With 16 GB RAM (Excel/OS use ~4-6 GB, leaving ~10-12 GB available), memory becomes
-              noticeable around: 200-300 arrays with 10,000 rows × 10 features ≈ 400-600 MB data
-              (800 MB-1.2 GB total with overhead). Significant memory pressure occurs around:
-              500-800 arrays with 10,000 rows × 10 features ≈ 1-1.6 GB data (2-3.2 GB total).
-              Beyond 1,000+ arrays, you risk memory errors or Excel crashes.
-    - Processing time: Frequentist mode is O(n log n) where n = total rows (combines all arrays).
-                      Bayesian mode is O(n_arrays × n log n) - processes each array separately.
-                      With 16 GB RAM, recommended practical limit: 10-30 arrays for frequentist,
-                      5-15 arrays for Bayesian mode (due to sequential processing).
-                      Beyond these limits, you will experience noticeable processing lag, especially
-                      in Bayesian mode or with Monte Carlo sampling enabled.
-    """
+def get_settings_path() -> str:
+    """Return the path to PyexcelSettings.xlsx beside this script."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILENAME)
+
+
+def settings_sheet_exists(path: str) -> bool:
+    """Return True if `path` exists and contains the SETTINGS_SHEET_NAME sheet."""
+    if not os.path.exists(path):
+        return False
+    settings_wb = xw.Book(path)
     try:
-        if not args:
-            return "#ERROR: At least one data array is required"
+        return SETTINGS_SHEET_NAME in {s.name for s in settings_wb.sheets}
+    finally:
+        settings_wb.close()
 
-        data_arrays, bools, contamination_raw, monte_carlo_samples, array_index = _parse_udf_args(
-            args, BOOL_SLOTS_ISOLATION
+
+def _to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().upper() == 'TRUE'
+
+
+def read_settings(path: str) -> dict:
+    """
+    Read the 'IsolationForest' settings sheet (label/value pairs in columns A/B).
+    Returns only keys that are present and non-blank; absent or blank keys are
+    omitted so callers fall through to built-in defaults.
+    """
+    settings_wb = xw.Book(path)
+    try:
+        sheet = settings_wb.sheets[SETTINGS_SHEET_NAME]
+        used = sheet.used_range
+        rows = used.value if used is not None else []
+        if rows and not isinstance(rows[0], (list, tuple)):
+            rows = [rows]
+        labels = {}
+        for row in rows or []:
+            if not row or row[0] is None:
+                continue
+            label = str(row[0]).strip()
+            labels[label] = row[1] if len(row) > 1 else None
+    finally:
+        settings_wb.close()
+
+    def present(label):
+        if label not in labels:
+            return False
+        value = labels[label]
+        return not (value is None or (isinstance(value, str) and not value.strip()))
+
+    settings: dict = {}
+    for key, _flags, label, kind, _default in SETTINGS_SCHEMA:
+        if not present(label):
+            continue
+        raw_value = labels[label]
+        if kind == 'list':
+            settings[key] = [s.strip() for s in str(raw_value).split(',') if s.strip()]
+        elif kind == 'bool':
+            settings[key] = _to_bool(raw_value)
+        elif kind == 'int':
+            settings[key] = int(raw_value)
+        elif kind == 'float':
+            settings[key] = float(raw_value)
+        else:  # 'str'
+            settings[key] = str(raw_value).strip()
+    return settings
+
+
+def create_default_settings(path: str) -> None:
+    """
+    Create PyexcelSettings.xlsx with a default 'IsolationForest' settings sheet.
+    If the workbook already exists (e.g. tabpfn_forecast.py created it with its
+    own sheet), open it and add/replace the 'IsolationForest' sheet rather than
+    overwriting the file.
+    """
+    default_rows = [
+        [label, '' if kind == 'list' else default]
+        for _key, _flags, label, kind, default in SETTINGS_SCHEMA
+    ]
+
+    file_exists = os.path.exists(path)
+    settings_wb = xw.Book(path) if file_exists else xw.Book()
+    try:
+        if SETTINGS_SHEET_NAME in {s.name for s in settings_wb.sheets}:
+            sheet = settings_wb.sheets[SETTINGS_SHEET_NAME]
+            sheet.clear()
+        elif file_exists:
+            sheet = settings_wb.sheets.add(SETTINGS_SHEET_NAME, after=settings_wb.sheets[-1])
+        else:
+            sheet = settings_wb.sheets[0]
+            sheet.name = SETTINGS_SHEET_NAME
+        sheet.range('A1').value = default_rows
+        sheet.range('A:A').column_width = 34
+        sheet.range('B:B').column_width = 26
+        settings_wb.save(path)
+    finally:
+        settings_wb.close()
+
+
+# =============================================================================
+# SHARED RUN FUNCTION (both entry points call this)
+# =============================================================================
+
+def run_isolation_forest_configured(
+    wb,
+    sheets: List[str],
+    contamination: float,
+    monte_carlo_samples: int,
+    ascending: bool,
+    epsilon: bool,
+    cumulative: bool,
+    output_sheet: str,
+) -> dict:
+    """
+    Run Isolation Forest anomaly scoring over one or more sheets and write the
+    combined result to `output_sheet`. Shared by the macro entry point and the CLI.
+
+    sheets: list of sheet names to read (empty = [wb.sheets[0].name]).
+    If cumulative and more than one sheet, scores sequentially with sheet k fit
+    on sheets 1..k (no lookahead); otherwise concatenates all sheets and scores once.
+    """
+    sheet_names = list(sheets) if sheets else [wb.sheets[0].name]
+
+    numeric_cols = None
+    per_sheet_df: List[pd.DataFrame] = []
+    for name in sheet_names:
+        sheet = wb.sheets[name]
+        data_range = sheet.used_range
+        raw = data_range.options(pd.DataFrame, index=False, header=1).value if data_range is not None else None
+        df = pd.DataFrame(raw) if raw is not None else pd.DataFrame()
+        df = df.dropna(how='all').reset_index(drop=True)
+        cols = list(df.select_dtypes(include=[np.number]).columns)
+        if numeric_cols is None:
+            numeric_cols = cols
+        elif cols != numeric_cols:
+            raise ValueError(f"Sheet '{name}' has different numeric columns than the first sheet")
+        per_sheet_df.append(df)
+
+    if not numeric_cols:
+        raise ValueError("No numeric columns found")
+
+    if contamination <= 0 or contamination > 0.5:
+        raise ValueError("contamination must be > 0 and <= 0.5")
+    if monte_carlo_samples != 0 and (monte_carlo_samples < 100 or monte_carlo_samples > 10000):
+        raise ValueError("monte_carlo_samples must be 0 (off) or between 100-10000")
+    if epsilon and not ascending:
+        raise ValueError("epsilon requires ascending. Epsilon only works with ascending scores.")
+
+    sheet_arrays = [df[numeric_cols].values.astype(np.float64) for df in per_sheet_df]
+
+    if cumulative and len(sheet_names) > 1:
+        scores_per_sheet, binary_per_sheet = _score_sheets_cumulative(
+            sheet_arrays, contamination, monte_carlo_samples, ascending, epsilon
         )
-        epsilon = bools['epsilon']
-        ascending = bools['ascending']
-        binary = bools['binary']
-        bayes_freq = bools['bayes_freq']
-
-        if not data_arrays:
-            return "#ERROR: At least one data array is required"
-
-        contamination = 0.1 if contamination_raw is None else contamination_raw
-        if contamination <= 0 or contamination > 0.5:
-            return "#ERROR: contamination must be > 0 and <= 0.5 (0 < contamination <= 0.5)"
-
-        if monte_carlo_samples != 0 and (monte_carlo_samples < 100 or monte_carlo_samples > 10000):
-            return "#ERROR: monte_carlo_samples must be 0 (off) or between 100-10000"
-
-        if epsilon and not ascending:
-            return "#ERROR: epsilon requires ascending=TRUE. Epsilon only works with ascending scores."
-
-        if bayes_freq and not binary:
-            return "#ERROR: bayes_freq only works when binary=TRUE"
-
-        try:
-            arrays, array_sizes, X, valid_mask = _arrays_to_numpy(data_arrays)
-        except ValueError as e:
-            return f"#ERROR: {e}"
-
-        n_arrays = len(arrays)
-        input_single_row = X.shape[0] == 1
-        X_clean = X[valid_mask]
-
-        if len(X_clean) < 2:
-            return "#ERROR: Need at least 2 valid data points"
+    else:
+        # Reproduces the original single-sheet CLI path exactly: fit once on all
+        # clean rows, then score via Monte Carlo or score_samples.
+        valid_masks = [~np.isnan(arr).any(axis=1) for arr in sheet_arrays]
+        X_clean = np.vstack([arr[m] for arr, m in zip(sheet_arrays, valid_masks)])
 
         model = IsolationForest(contamination=contamination, random_state=RANDOM_SEED)
         model.fit(X_clean)
 
         if monte_carlo_samples > 0:
-            scores = monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples)
+            scores_clean = monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples)
         else:
-            scores = model.score_samples(X_clean)
+            scores_clean = model.score_samples(X_clean)
 
-        scores = _apply_score_transforms(scores, ascending, epsilon)
+        scores_clean = _apply_score_transforms(scores_clean, ascending, epsilon)
+        binary_clean = _scores_to_binary(scores_clean, contamination, ascending)
 
-        binary_predictions = None
-        all_binary = None
-        if binary:
-            if bayes_freq and n_arrays > 1:
-                all_binary, binary_predictions = _bayesian_cumulative_binary(
-                    arrays, array_sizes, contamination, monte_carlo_samples,
-                    ascending, epsilon, n_arrays,
-                )
-            else:
-                binary_predictions = _scores_to_binary(scores, contamination, ascending)
+        scores_per_sheet = []
+        binary_per_sheet = []
+        pos = 0
+        for arr, m in zip(sheet_arrays, valid_masks):
+            n_valid = int(np.sum(m))
+            s = np.full(len(arr), np.nan)
+            b = np.full(len(arr), np.nan)
+            s[m] = scores_clean[pos:pos + n_valid]
+            b[m] = binary_clean[pos:pos + n_valid]
+            scores_per_sheet.append(s)
+            binary_per_sheet.append(b)
+            pos += n_valid
 
-        if array_index > 0:
-            if array_index > n_arrays:
-                return f"#ERROR: array_index {array_index} exceeds number of arrays ({n_arrays})"
-            if n_arrays == 1:
-                return "#ERROR: array_index can only be used with multiple arrays"
+    output_rows = []
+    n_anomalies = 0
+    n_samples = 0
+    for name, arr, scores, binary in zip(sheet_names, sheet_arrays, scores_per_sheet, binary_per_sheet):
+        valid_mask = ~np.isnan(arr).any(axis=1)
+        for row_idx in range(len(arr)):
+            if not valid_mask[row_idx] or np.isnan(scores[row_idx]):
+                continue
+            is_anom = binary[row_idx]
+            label = 'Anomaly' if is_anom == 1 else 'Normal'
+            output_rows.append([name, row_idx + 1] + arr[row_idx].tolist() + [float(scores[row_idx]), label])
+            n_samples += 1
+            if is_anom == 1:
+                n_anomalies += 1
 
-        return _build_excel_output(
-            array_sizes, valid_mask, scores, n_arrays, input_single_row, array_index,
-            binary, binary_predictions, all_binary, bayes_freq,
-        )
+    if output_sheet not in {s.name for s in wb.sheets}:
+        out_sht = wb.sheets.add(output_sheet, after=wb.sheets[-1])
+    else:
+        out_sht = wb.sheets[output_sheet]
+        out_sht.clear()
 
-    except Exception as e:
-        return f"#ERROR: {e}"
+    header = ['Source Sheet', 'Index'] + list(numeric_cols) + ['Anomaly Score', 'Is Anomaly']
+    out_sht.range('A1').value = [header]
+    if output_rows:
+        out_sht.range('A2').value = output_rows
+
+    wb.save()
+
+    return {
+        'n_sheets': len(sheet_names),
+        'n_samples': n_samples,
+        'n_features': len(numeric_cols),
+        'n_anomalies': n_anomalies,
+        'output_sheet': output_sheet,
+    }
 
 
-@xw.func
-def ANOMALY_BINARY(
-    *args
-) -> Union[int, List[List]]:
-    """
-    Excel UDF for Isolation Forest binary anomaly detection - returns 0 or 1 per data point.
-    
-    Returns binary predictions: 1 = anomaly, 0 = normal.
-    
-    Parameters (in order):
-        *args: Input data arrays followed by optional parameters in this specific order:
-              - One or more data arrays (rows x columns format)
-              - Each row = one data point, each column = one feature
-              - Multiple arrays are combined (all must have same number of columns)
-              
-              Optional parameters (can be specified in any order after data arrays):
-              Parameters are identified by type/pattern, so you can specify them in any order.
-              - prior_contamination: 0-0.5 decimal (e.g., 0.1 for 10%)
-              - monte_carlo_samples: 0 or 100-10000 integer (Monte Carlo resampling for scores)
-              - bayes_freq: TRUE/FALSE boolean
-              - array_index: 0 or 1-indexed integer (for multiple arrays)
-              
-              - prior_contamination: Prior contamination rate for first array (0-0.5 as decimal)
-                     Default: 0.1 (10%)
-                     Examples: 0.05 = 5%, 0.1 = 10%, 0.5 = 50% (max)
-                     Maximum is 0.5 (50%) based on the fundamental assumption of Isolation Forest
-                     (Liu et al., 2008) that anomalies are "few and different" - i.e., they should be
-                     a minority of the data. Beyond 0.5, the distinction between "normal" and
-                     "anomalous" becomes meaningless, as you'd be assuming more than half your
-                     data is anomalous, which contradicts the algorithm's core premise.
-                     Reference: Liu, F. T., Ting, K. M., & Zhou, Z.-H. (2008). Isolation Forest.
-                     In 2008 Eighth IEEE International Conference on Data Mining (pp. 413-422).
+# =============================================================================
+# MACRO ENTRY POINT (call via Alt+F8 / RunPython)
+# =============================================================================
 
-                     When bayes_freq=TRUE, this is the prior for the first array
-                     When bayes_freq=FALSE (default), this is the contamination for all arrays
-                     Note: Higher prior_contamination sets a higher percentile threshold, which means
-                     more points are counted as anomalies initially. This leads to higher variance
-                     (uncertainty) in the Beta posterior distribution itself, meaning the contamination
-                     rate estimate has more uncertainty. The threshold recalibrates based on the posterior
-                     mean, which with higher variance can swing more, but update magnitude also depends
-                     on the actual data observed.
-
-                     Obviously, this doesn't do anything if you have only one array.
-
-                     A contamination rate of 0% will always return 0 for all points and never update.
-              - monte_carlo_samples: Number of Monte Carlo resampling iterations (0 or 100-10000)
-                     Default: 0 (off)
-                     Must be 0 (disabled) or between 100-10000
-                     Throttled to 100 samples per 0.5 seconds - only change if your computer can handle it
-                     Uses bootstrap resampling to aggregate scores across iterations, providing more
-                     robust anomaly detection. When enabled, scores are computed via Monte Carlo method
-                     and then thresholded to produce binary predictions.
-              - bayes_freq: Boolean, if TRUE uses Bayesian updating of contamination across arrays
-                     Default: FALSE (frequentist, combines all arrays, fits once)
-                     TRUE (BAYES): Fits each array sequentially, updates contamination using
-                     Beta-Binomial conjugate prior. Uses continuous anomaly scores from 
-                     score_samples() to determine anomalies based on actual data structure, then
-                     updates contamination rate based on score distribution. 
-                     
-                     Bayes theorem recap: Beta(α, β) prior where α/(α+β) = prior_contamination,
-                     then updates: α += anomalies_found, β += normal_points_found for each array.
-                     
-                     IMPORTANT LIMITATION: The procedure updates a Beta prior using counts that are
-                     defined by the parameter being updated (threshold = posterior mean percentile),
-                     so the posterior reflects the stability of the cutoff, not evidence about the
-                     true population anomaly rate. This is a self-consistency measure, not Bayesian
-                     inference about an unknown parameter from independent observations.
-
-              - array_index: Integer, 1-indexed array number to return (0 = return all arrays)
-                     Default: 0 (return all columns)
-                     Examples: 1 = first array only, 2 = second array only
-                     Only works with multiple arrays. Returns error if index exceeds number of arrays.
-    
-    Returns:
-        Binary predictions (1 = anomaly, 0 = normal):
-        - Single value if input is single row (1 data point)
-        - Column array (n_rows x 1) if single array input
-        - Multiple columns (one per input array) if multiple arrays, padded to max length
-    
-    Usage (parameters can be in any order after data arrays):
-        =ANOMALY_BINARY(A2:E100)  # Single array (default 10% contamination)
-        =ANOMALY_BINARY(A2:E100, 0.05)  # 5% contamination
-        =ANOMALY_BINARY(A2:E100, 1000)  # 1000 Monte Carlo samples (contamination=default)
-        =ANOMALY_BINARY(A2:E50, G2:J50)  # Multiple arrays (combined, no Bayesian updating)
-        =ANOMALY_BINARY(A2:E50, G2:J50, TRUE)  # Multiple arrays with Bayesian updating (prior=default)
-        =ANOMALY_BINARY(A2:E50, G2:J50, 0.1, TRUE)  # Multiple arrays with 10% prior + Bayesian updating
-        =ANOMALY_BINARY(A2:E50, G2:J50, 0.1, 1000, TRUE)  # With Monte Carlo + Bayesian updating
-        =ANOMALY_BINARY(A2:E50, G2:J50, 2)  # Multiple arrays, return only 2nd array
-        =ANOMALY_BINARY(A2:E50, G2:J50, 0.1, TRUE, 2)  # Multiple arrays with params in any order
-    
-    Note: All input arrays must have the same number of columns (features).
-          Contamination must be between 0 and 0.5 (exclusive of 0, inclusive of 0.5).
-          
-    Practical Limits:
-    - Excel formula length: Maximum 8,192 characters (theoretical limit ~700-1000 arrays)
-    - Memory: Isolation Forest is O(n) in memory where n = total rows across all arrays.
-              For 16 GB RAM, typical limits: ~10-50 arrays with 1,000-10,000 rows each.
-              Memory usage ≈ (total_rows × features × 8 bytes) + model overhead.
-              Example: 50 arrays × 5,000 rows × 10 features ≈ 20 MB (negligible for 16 GB).
-    - Processing time: Frequentist mode is O(n log n) where n = total rows (combines all arrays).
-                      Bayesian mode is O(n_arrays × n log n) - processes each array separately.
-                      With 16 GB RAM, recommended practical limit: 10-30 arrays for frequentist,
-                      5-15 arrays for Bayesian mode (due to sequential processing).
-                      Beyond this, Excel may become slow or unresponsive.
-    """
+def run_isolation_forest():
+    """Macro entry point. Invoked from VBA via RunPython."""
     try:
-        if not args:
-            return "#ERROR: At least one data array is required"
+        wb = xw.Book.caller()
+        settings_path = get_settings_path()
 
-        data_arrays, bools, prior_raw, monte_carlo_samples, array_index = _parse_udf_args(
-            args, BOOL_SLOTS_ANOMALY
-        )
-        bayes_freq = bools['bayes_freq']
-
-        if not data_arrays:
-            return "#ERROR: At least one data array is required"
-
-        prior_contamination = 0.1 if prior_raw is None else prior_raw
-        if prior_contamination <= 0 or prior_contamination > 0.5:
-            return "#ERROR: prior_contamination must be > 0 and <= 0.5 (0 < prior_contamination <= 0.5)"
-
-        if monte_carlo_samples != 0 and (monte_carlo_samples < 100 or monte_carlo_samples > 10000):
-            return "#ERROR: monte_carlo_samples must be 0 (off) or between 100-10000"
-
-        try:
-            arrays, array_sizes, X, valid_mask = _arrays_to_numpy(data_arrays)
-        except ValueError as e:
-            return f"#ERROR: {e}"
-
-        n_arrays = len(arrays)
-        input_single_row = X.shape[0] == 1
-
-        if bayes_freq and n_arrays > 1:
-            _, all_valid_masks, predictions = _bayesian_cumulative_predictions(
-                arrays, array_sizes, prior_contamination, monte_carlo_samples, n_arrays,
+        if not settings_sheet_exists(settings_path):
+            create_default_settings(settings_path)
+            wb.app.alert(
+                f"Created '{SETTINGS_FILENAME}' with default configuration.\n\n"
+                f"Location: {settings_path}\n\n"
+                "Please configure the 'IsolationForest' sheet, then run this macro again."
             )
-            valid_mask = np.concatenate(all_valid_masks)
-        else:
-            valid_mask = ~np.isnan(X).any(axis=1)
-            X_clean = X[valid_mask]
-            if len(X_clean) < 2:
-                return "#ERROR: Need at least 2 valid data points"
-            model = IsolationForest(contamination=prior_contamination, random_state=RANDOM_SEED)
-            model.fit(X_clean)
-            predictions = (model.predict(X_clean) == -1).astype(int)
+            return
 
-        if array_index > 0:
-            if array_index > n_arrays:
-                return f"#ERROR: array_index {array_index} exceeds number of arrays ({n_arrays})"
-            if n_arrays == 1:
-                return "#ERROR: array_index can only be used with multiple arrays"
-
-        if input_single_row:
-            return int(predictions[0])
-        if n_arrays == 1:
-            return predictions.reshape(-1, 1).tolist()
-
-        return _build_excel_output(
-            array_sizes, valid_mask, predictions, n_arrays, False, array_index,
-            False, None, None, False,
+        raw = read_settings(settings_path)
+        cfg = {key: raw.get(key, default) for key, _, _, _, default in SETTINGS_SCHEMA}
+        results = run_isolation_forest_configured(
+            wb,
+            cfg['sheets'],
+            cfg['contamination'],
+            cfg['monte_carlo_samples'],
+            cfg['ascending'],
+            cfg['epsilon'],
+            cfg['cumulative'],
+            cfg['output_sheet'],
         )
 
+        wb.app.alert(
+            f"Anomaly Detection Complete!\n\n"
+            f"Sheets: {results['n_sheets']}\n"
+            f"Samples: {results['n_samples']}\n"
+            f"Features: {results['n_features']}\n"
+            f"Anomalies: {results['n_anomalies']}\n\n"
+            f"See '{results['output_sheet']}' sheet for details."
+        )
     except Exception as e:
-        return f"#ERROR: {e}"
+        xw.Book.caller().app.alert(f"Error: {e}")
 
 
 # =============================================================================
@@ -752,128 +472,90 @@ def ANOMALY_BINARY(
 # =============================================================================
 
 def main():
-    """
-    CLI entry point - processes first sheet in Excel file.
-    
-    Note: Assumes row 1 contains column headers. Data starts at row 2.
-    All numeric columns are used as features. Rows with any NaN values are excluded.
-    """
+    """CLI entry point. python isolation_forest.py <workbook.xlsx> [flags]"""
     parser = argparse.ArgumentParser(description='Isolation Forest Anomaly Detection (CLI mode)')
     parser.add_argument('excel_path', help='Path to Excel workbook')
-    parser.add_argument('--sheet', help='Sheet name to process (default: first sheet)')
-    parser.add_argument('--contamination', type=float, default=0.1, help='Expected proportion of anomalies (default: 0.1)')
-    parser.add_argument('--monte-carlo-samples', type=int, default=0, help='Monte Carlo resampling iterations (0=off, 100-10000)')
-    parser.add_argument('--ascending', action='store_true', help='Use ascending scores (high score = highly anomalous)')
-    parser.add_argument('--epsilon', action='store_true', help='Shift scores to ensure all values > 0 (requires --ascending)')
-    parser.add_argument('--output-sheet', default='AnomalyScores', help='Output sheet name (default: AnomalyScores)')
-    
+    for key, flags, label, kind, default in SETTINGS_SCHEMA:
+        help_text = _SETTINGS_HELP.get(key, f'{label} (default: {default})')
+        if kind == 'bool':
+            parser.add_argument(*flags, dest=key, action='store_true', help=help_text)
+        elif kind == 'int':
+            parser.add_argument(*flags, dest=key, type=int, default=None, help=help_text)
+        elif kind == 'float':
+            parser.add_argument(*flags, dest=key, type=float, default=None, help=help_text)
+        else:  # 'str' or 'list'
+            parser.add_argument(*flags, dest=key, default=None, help=help_text)
+    parser.add_argument('--settings', default=None, help='Path to settings workbook (default: PyexcelSettings.xlsx beside this script)')
+
     args = parser.parse_args()
-    
+
     try:
+        if args.settings:
+            if not os.path.exists(args.settings):
+                print(f"ERROR: settings file not found: {args.settings}", file=sys.stderr)
+                return 1
+            if not settings_sheet_exists(args.settings):
+                print(f"ERROR: settings file '{args.settings}' does not contain the '{SETTINGS_SHEET_NAME}' sheet", file=sys.stderr)
+                return 1
+            settings = read_settings(args.settings)
+        else:
+            default_settings_path = get_settings_path()
+            settings = read_settings(default_settings_path) if settings_sheet_exists(default_settings_path) else {}
+
+        cfg = {}
+        reported = []
+        for key, _flags, _label, kind, default in SETTINGS_SCHEMA:
+            flag_value = getattr(args, key)
+            if kind == 'bool':
+                if flag_value:
+                    value, from_settings = True, False
+                elif key in settings:
+                    value, from_settings = settings[key], True
+                else:
+                    value, from_settings = default, False
+            elif kind == 'list':
+                if flag_value is not None:
+                    value = [s.strip() for s in flag_value.split(',') if s.strip()]
+                    from_settings = False
+                elif key in settings:
+                    value = settings[key]
+                    from_settings = True
+                else:
+                    value = default
+                    from_settings = False
+            else:
+                if flag_value is not None:
+                    value, from_settings = flag_value, False
+                elif key in settings:
+                    value, from_settings = settings[key], True
+                else:
+                    value, from_settings = default, False
+            cfg[key] = value
+            if from_settings:
+                reported.append((key, value))
+
+        for name, value in reported:
+            print(f"settings: {name}={value}")
+
         wb = xw.Book(args.excel_path)
-        
-        # Get sheet to process
-        if args.sheet:
-            sheet = wb.sheets[args.sheet]
-        else:
-            sheet = wb.sheets[0]
-        
-        # Read data
-        # Note: header=1 assumes row 1 contains column headers, data starts at row 2
-        if (data_range := sheet.used_range) is None:
-            print("ERROR: No data found in sheet!", file=sys.stderr)
-            return 1
-        
-        raw_data = data_range.options(pd.DataFrame, header=1).value
-        if raw_data is None or len(raw_data) == 0:
-            print("ERROR: No data found in sheet!", file=sys.stderr)
-            return 1
-        
-        # Remove entirely NaN rows
-        df = pd.DataFrame(raw_data).dropna(how='all').reset_index(drop=True)
-        
-        # Use all numeric columns (cache result)
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        n_features = len(numeric_cols)  # Cache for later use
-        if n_features == 0:
-            print("ERROR: No numeric columns found!", file=sys.stderr)
-            return 1
-        
-        # Remove NaN rows (vectorized)
-        valid_mask = ~np.isnan(X := df[numeric_cols].values.astype(np.float64)).any(axis=1)
-        X_clean = X[valid_mask]
-        n_samples_clean = len(X_clean)  # Cache for later use
-        
-        if n_samples_clean < 2:
-            print("ERROR: Need at least 2 valid data points!", file=sys.stderr)
-            return 1
-        
-        # Validate contamination
-        if args.contamination <= 0 or args.contamination > 0.5:
-            print("ERROR: contamination must be > 0 and <= 0.5", file=sys.stderr)
-            return 1
-        
-        # Validate Monte Carlo samples
-        if args.monte_carlo_samples != 0 and (args.monte_carlo_samples < 100 or args.monte_carlo_samples > 10000):
-            print("ERROR: monte_carlo_samples must be 0 (off) or between 100-10000", file=sys.stderr)
-            return 1
-        
-        # Validate epsilon requires ascending
-        if args.epsilon and not args.ascending:
-            print("ERROR: epsilon requires --ascending. Epsilon only works with ascending scores.", file=sys.stderr)
-            return 1
-        
-        # Fit and score
-        # n_estimators defaults to 100 in sklearn (optimal: path lengths converge)
-        # max_samples="auto" (sklearn default) automatically adapts to data size
-        model = IsolationForest(
-            contamination=args.contamination,
-            random_state=RANDOM_SEED
+        results = run_isolation_forest_configured(
+            wb, cfg['sheets'], cfg['contamination'], cfg['monte_carlo_samples'],
+            cfg['ascending'], cfg['epsilon'], cfg['cumulative'], cfg['output_sheet'],
         )
-        model.fit(X_clean)
-        
-        # Score data (one score per row) - O(n)
-        if args.monte_carlo_samples > 0:
-            anomaly_scores = monte_carlo_score_samples(X_clean, args.contamination, args.monte_carlo_samples)
-        else:
-            anomaly_scores = model.score_samples(X_clean)
-        
-        anomaly_scores = _apply_score_transforms(anomaly_scores, args.ascending, args.epsilon)
-        binary_predictions = _scores_to_binary(anomaly_scores, args.contamination, args.ascending)
-        
-        # Write output (cache sheet names for O(1) lookup)
-        if args.output_sheet not in {s.name for s in wb.sheets}:
-            out_sht = wb.sheets.add(args.output_sheet, after=wb.sheets[-1])
-        else:
-            out_sht = wb.sheets[args.output_sheet]
-            out_sht.clear()
-        
-        # Build data rows efficiently (vectorized where possible)
-        # Pre-compute anomaly labels from binary predictions
-        anomaly_labels = np.where(binary_predictions == 1, 'Anomaly', 'Normal')
-        data_rows = []
-        valid_idx = 0
-        for orig_idx in range(len(df)):
-            if valid_mask[orig_idx]:
-                data_rows.append([orig_idx + 1] + X_clean[valid_idx].tolist() + [
-                    anomaly_scores[valid_idx], 
-                    anomaly_labels[valid_idx]
-                ])
-                valid_idx += 1
-        
-        out_sht.range('A1').value = [['Index'] + list(numeric_cols) + ['Anomaly Score', 'Is Anomaly']]
-        out_sht.range('A2').value = data_rows
-        
-        wb.save()
-        
-        n_anomalies = np.sum(binary_predictions)
+
+        n_samples = results['n_samples']
+        n_anomalies = results['n_anomalies']
         print(f"\n{'='*50}")
         print(f"Anomaly Detection Complete!")
-        print(f"Features: {n_features}")
-        print(f"Samples: {n_samples_clean}")
-        print(f"Anomalies: {n_anomalies} ({n_anomalies/n_samples_clean:.2%})")
-        print(f"See '{args.output_sheet}' sheet for details.")
-        
+        print(f"Sheets: {results['n_sheets']}")
+        print(f"Features: {results['n_features']}")
+        print(f"Samples: {n_samples}")
+        if n_samples:
+            print(f"Anomalies: {n_anomalies} ({n_anomalies/n_samples:.2%})")
+        else:
+            print(f"Anomalies: {n_anomalies}")
+        print(f"See '{results['output_sheet']}' sheet for details.")
+
         return 0
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -882,4 +564,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-

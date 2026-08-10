@@ -22,7 +22,8 @@ echo "[1/4] Activating Miniconda..."
 source miniconda/bin/activate
 
 echo "[2/4] Creating conda environment from environment.yml..."
-conda env create -f environment.yml --force
+conda env remove -n excelpy --yes
+conda env create -f environment.yml
 
 echo "[3/4] Activating excelpy environment..."
 conda activate excelpy
@@ -36,20 +37,25 @@ echo "Setup Complete!"
 echo "========================================"
 echo ""
 
-# Get the full path to isolation_forest.py
-PYTHON_FILE="$(cd "$(dirname "$0")" && pwd)/isolation_forest.py"
-echo "IMPORTANT: Python file location:"
-echo "$PYTHON_FILE"
+# Get the full path to the scripts folder
+SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+echo "IMPORTANT: Scripts folder location:"
+echo "$SCRIPTS_DIR"
 echo ""
 
 echo "Next steps:"
-echo "1. Open Excel"
-echo "2. You should see the xlwings ribbon"
-echo "3. Click 'Import Functions'"
-echo "4. Navigate to and select: isolation_forest.py"
-echo "   (Full path shown above)"
-echo "5. Use =ISOLATION_FOREST(...) in your formulas"
+echo "1. Open your workbook in Excel and save it as .xlsm"
+echo "2. Alt+F11 -> File -> Import File -> select pyexcel_macros.bas"
+echo "   (Full path: $SCRIPTS_DIR/pyexcel_macros.bas)"
+echo "3. In the VBA editor set SCRIPT_DIR to the scripts folder path shown above"
+echo "4. Alt+F8 -> RunIsolationForest or RunForecast"
+echo "5. First run creates PyexcelSettings.xlsx beside the scripts -"
+echo "   configure it and run again"
 echo ""
-echo "TIP: Keep isolation_forest.py in this folder for easy access"
+echo "CLI alternative (no Excel/VBA required):"
+echo "  python isolation_forest.py <workbook.xlsx>"
+echo "  python tabpfn_forecast.py <workbook.xlsx>"
+echo ""
+echo "TIP: Keep the scripts in this folder for easy access"
 echo ""
 
