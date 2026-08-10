@@ -99,3 +99,4 @@ Labels are read from the `IsolationForest` / `Forecast` sheets in `PyexcelSettin
 | Macro not listed under Alt+F8 | Re-import `pyexcel_macros.bas`; confirm workbook is saved as `.xlsm` |
 | CLI can't find `PyexcelSettings.xlsx` | Pass `--settings <path>` or place it beside the script |
 | Workbook save fails | Close the workbook in Excel, then re-run |
+| macOS keeps asking permission for the same folder | Excel is sandboxed, and each new Excel process needs a fresh grant to open files a script names. Leave Excel running between runs, or open the workbook yourself first and the CLI will attach to it. Granting Excel access to the folder under System Settings -> Privacy & Security -> Files and Folders also helps. |
