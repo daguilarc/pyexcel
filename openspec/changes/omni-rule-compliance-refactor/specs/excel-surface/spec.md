@@ -24,13 +24,13 @@ Macros SHALL read configuration from `PyexcelSettings.xlsx` (sheets `Forecast` a
 - **WHEN** a macro runs and no settings workbook exists
 - **THEN** it creates `PyexcelSettings.xlsx` with both tool sheets populated with defaults and tells the user to configure and re-run
 
-#### Scenario: Isolation forest multi-sheet cumulative mode
-- **WHEN** the IsolationForest settings list multiple data sheets with `Cumulative Sheets` enabled
-- **THEN** sheet k is scored against a model fit on sheets 1..k only (no lookahead), with contamination held constant
+#### Scenario: Isolation forest multi-sheet mode is a single pooled fit
+- **WHEN** the IsolationForest settings list multiple data sheets
+- **THEN** all sheets' valid rows are pooled into one fit and scored together, and the output sheet's `Source Sheet` column identifies each row's origin
 
-#### Scenario: No-op Beta updating removed
-- **WHEN** searching either script for Beta-prior contamination updating
-- **THEN** it is absent — measurement during apply showed the update is a mathematical no-op (the threshold is the contamination-quantile, so the flagged fraction equals the prior by construction; measured drift across 6 heterogeneous sheets was 0.002-0.004, all quantile rounding), so the claim was removed rather than documented
+#### Scenario: The former Bayesian/sequential mode is gone
+- **WHEN** searching isolation_forest.py for Beta-prior contamination updating or cumulative per-sheet scoring
+- **THEN** both are absent. The Beta updating was measured during apply to be a mathematical no-op (the threshold is the contamination-quantile, so the flagged fraction equals the prior by construction; drift across 6 heterogeneous sheets was 0.002-0.004, all quantile rounding). The cumulative no-lookahead fitting underneath it was then removed as well, by decision, leaving one scoring path. The genuine Bayesian MCMC mode in tabpfn_forecast.py (Bambi/PyMC) is unaffected.
 
 ### Requirement: Setup scripts work on current conda and cover both tools
 `setup.sh`/`setup.bat` SHALL NOT use `conda env create --force` (absent from current conda; use `--yes`/recreate logic) and SHALL print next steps for both tools including the VBA module import.

@@ -28,7 +28,9 @@ The following SHALL be removed: the never-called trio `detect_header_row`/`clean
 - **THEN** every retained private helper has a cited caller, and grep finds zero references to the removed names
 
 ### Requirement: Repetition eliminated within each file (omni-rule §8)
-Near-identical logic occurring 2+ times within a file SHALL be single-sourced at the call graph, each new helper passing §6's 2-of-4 gate: Bayesian cumulative loops (isolation_forest.py:152-190/193-232, line-221 threshold variant parameterized as a classified deliberate difference), macro/CLI settings plumbing per file, get-or-create-sheet (tabpfn_forecast.py:666-670/847-851), gamma offset (×3), `add_constant` guard (×5), MC aggregation (×2), mean+noise (×2).
+Near-identical logic occurring 2+ times within a file SHALL be single-sourced at the call graph, each new helper passing §6's 2-of-4 gate: macro/CLI settings plumbing per file, per-setting label/flag/type/default metadata (one `SETTINGS_SCHEMA` table per file, consumed by the reader, the scaffolder, the macro entry and the CLI parser), get-or-create-sheet (tabpfn_forecast.py:666-670/847-851), gamma offset (×3), `add_constant` guard (×5), MC aggregation (×2), mean+noise (×2).
+
+The two Bayesian cumulative loops (isolation_forest.py:152-190/193-232) were originally slated for merging on the premise that the line-221 threshold was a deliberate variant. That premise was FALSE — it is byte-equivalent to `_scores_to_binary(scores, c, ascending=False)`, so the two functions were the same function. They were merged, and the merged result was subsequently deleted outright when the whole cumulative mode was removed.
 
 #### Scenario: Found-vs-changed reporting
 - **WHEN** the consolidation task completes

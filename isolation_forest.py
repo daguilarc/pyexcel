@@ -16,7 +16,7 @@ import sys
 import os
 import argparse
 import time
-from typing import List, Tuple
+from typing import List
 from sklearn.ensemble import IsolationForest
 
 
@@ -39,7 +39,6 @@ SETTINGS_SCHEMA = [
     ('monte_carlo_samples', ('--monte-carlo-samples',), 'Monte Carlo Samples', 'int', 0),
     ('ascending', ('--ascending',), 'Ascending', 'bool', False),
     ('epsilon', ('--epsilon',), 'Epsilon', 'bool', False),
-    ('cumulative', ('--cumulative',), 'Cumulative Sheets', 'bool', False),
     ('output_sheet', ('--output-sheet',), 'Output Sheet', 'str', 'AnomalyScores'),
 ]
 
@@ -50,7 +49,6 @@ _SETTINGS_HELP = {
     'monte_carlo_samples': 'Monte Carlo resampling iterations (0=off, 100-10000)',
     'ascending': 'Use ascending scores (high score = highly anomalous)',
     'epsilon': 'Shift scores to ensure all values > 0 (requires --ascending)',
-    'cumulative': 'Score sheets cumulatively (sheet k fit on sheets 1..k, no lookahead)',
     'output_sheet': 'Output sheet name (default: AnomalyScores)',
 }
 
@@ -71,64 +69,6 @@ def _scores_to_binary(scores: np.ndarray, contamination: float, ascending: bool)
     if ascending:
         return (scores >= threshold_val).astype(int)
     return (scores <= threshold_val).astype(int)
-
-
-def _fit_score_array(
-    arr_clean: np.ndarray,
-    contamination: float,
-    monte_carlo_samples: int,
-    X_cumulative: np.ndarray,
-) -> np.ndarray:
-    # Only fit the IsolationForest when it will actually be used for scoring;
-    # on the Monte Carlo path the fitted model is discarded unused.
-    if monte_carlo_samples > 0:
-        return monte_carlo_score_samples(arr_clean, contamination, monte_carlo_samples)
-    model = IsolationForest(contamination=contamination, random_state=RANDOM_SEED)
-    model.fit(X_cumulative)
-    return model.score_samples(arr_clean)
-
-
-def _score_sheets_cumulative(
-    arrays: List[np.ndarray],
-    contamination: float,
-    monte_carlo_samples: int,
-    ascending: bool,
-    epsilon: bool,
-) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """
-    Sequential per-sheet scoring with no lookahead: sheet k is scored against a
-    model fit on sheets 1..k (cumulative), with contamination held constant
-    across all sheets. Returns (scores_per_sheet, binary_per_sheet).
-    """
-    scores_per_sheet: List[np.ndarray] = []
-    binary_per_sheet: List[np.ndarray] = []
-    cumulative_arrays: List[np.ndarray] = []
-
-    for arr in arrays:
-        arr_valid_mask = ~np.isnan(arr).any(axis=1)
-        arr_clean = arr[arr_valid_mask]
-
-        if len(arr_clean) < 2:
-            scores_per_sheet.append(np.full(len(arr), np.nan))
-            binary_per_sheet.append(np.full(len(arr), np.nan))
-            continue
-
-        cumulative_arrays.append(arr_clean)
-        X_cumulative = np.vstack(cumulative_arrays) if len(cumulative_arrays) > 1 else cumulative_arrays[0]
-
-        arr_scores = _fit_score_array(arr_clean, contamination, monte_carlo_samples, X_cumulative)
-        arr_scores = _apply_score_transforms(arr_scores, ascending, epsilon)
-        arr_binary = _scores_to_binary(arr_scores, contamination, ascending)
-
-        score_result = np.full(len(arr), np.nan)
-        score_result[arr_valid_mask] = arr_scores
-        binary_result = np.full(len(arr), np.nan)
-        binary_result[arr_valid_mask] = arr_binary
-
-        scores_per_sheet.append(score_result)
-        binary_per_sheet.append(binary_result)
-
-    return scores_per_sheet, binary_per_sheet
 
 
 def monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples, stationary_bootstrap_p=0.1):
@@ -312,7 +252,6 @@ def run_isolation_forest_configured(
     monte_carlo_samples: int,
     ascending: bool,
     epsilon: bool,
-    cumulative: bool,
     output_sheet: str,
 ) -> dict:
     """
@@ -320,8 +259,6 @@ def run_isolation_forest_configured(
     combined result to `output_sheet`. Shared by the macro entry point and the CLI.
 
     sheets: list of sheet names to read (empty = [wb.sheets[0].name]).
-    If cumulative and more than one sheet, scores sequentially with sheet k fit
-    on sheets 1..k (no lookahead); otherwise concatenates all sheets and scores once.
     """
     sheet_names = list(sheets) if sheets else [wb.sheets[0].name]
 
@@ -352,39 +289,36 @@ def run_isolation_forest_configured(
 
     sheet_arrays = [df[numeric_cols].values.astype(np.float64) for df in per_sheet_df]
 
-    if cumulative and len(sheet_names) > 1:
-        scores_per_sheet, binary_per_sheet = _score_sheets_cumulative(
-            sheet_arrays, contamination, monte_carlo_samples, ascending, epsilon
-        )
+    # Fit once on every clean row across all sheets, then score.
+    valid_masks = [~np.isnan(arr).any(axis=1) for arr in sheet_arrays]
+    X_clean = np.vstack([arr[m] for arr, m in zip(sheet_arrays, valid_masks)])
+
+    if len(X_clean) < 2:
+        raise ValueError("Need at least 2 valid data points")
+
+    model = IsolationForest(contamination=contamination, random_state=RANDOM_SEED)
+    model.fit(X_clean)
+
+    if monte_carlo_samples > 0:
+        scores_clean = monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples)
     else:
-        # Reproduces the original single-sheet CLI path exactly: fit once on all
-        # clean rows, then score via Monte Carlo or score_samples.
-        valid_masks = [~np.isnan(arr).any(axis=1) for arr in sheet_arrays]
-        X_clean = np.vstack([arr[m] for arr, m in zip(sheet_arrays, valid_masks)])
+        scores_clean = model.score_samples(X_clean)
 
-        model = IsolationForest(contamination=contamination, random_state=RANDOM_SEED)
-        model.fit(X_clean)
+    scores_clean = _apply_score_transforms(scores_clean, ascending, epsilon)
+    binary_clean = _scores_to_binary(scores_clean, contamination, ascending)
 
-        if monte_carlo_samples > 0:
-            scores_clean = monte_carlo_score_samples(X_clean, contamination, monte_carlo_samples)
-        else:
-            scores_clean = model.score_samples(X_clean)
-
-        scores_clean = _apply_score_transforms(scores_clean, ascending, epsilon)
-        binary_clean = _scores_to_binary(scores_clean, contamination, ascending)
-
-        scores_per_sheet = []
-        binary_per_sheet = []
-        pos = 0
-        for arr, m in zip(sheet_arrays, valid_masks):
-            n_valid = int(np.sum(m))
-            s = np.full(len(arr), np.nan)
-            b = np.full(len(arr), np.nan)
-            s[m] = scores_clean[pos:pos + n_valid]
-            b[m] = binary_clean[pos:pos + n_valid]
-            scores_per_sheet.append(s)
-            binary_per_sheet.append(b)
-            pos += n_valid
+    scores_per_sheet = []
+    binary_per_sheet = []
+    pos = 0
+    for arr, m in zip(sheet_arrays, valid_masks):
+        n_valid = int(np.sum(m))
+        s = np.full(len(arr), np.nan)
+        b = np.full(len(arr), np.nan)
+        s[m] = scores_clean[pos:pos + n_valid]
+        b[m] = binary_clean[pos:pos + n_valid]
+        scores_per_sheet.append(s)
+        binary_per_sheet.append(b)
+        pos += n_valid
 
     output_rows = []
     n_anomalies = 0
@@ -451,7 +385,6 @@ def run_isolation_forest():
             cfg['monte_carlo_samples'],
             cfg['ascending'],
             cfg['epsilon'],
-            cfg['cumulative'],
             cfg['output_sheet'],
         )
 
@@ -540,7 +473,7 @@ def main():
         wb = xw.Book(args.excel_path)
         results = run_isolation_forest_configured(
             wb, cfg['sheets'], cfg['contamination'], cfg['monte_carlo_samples'],
-            cfg['ascending'], cfg['epsilon'], cfg['cumulative'], cfg['output_sheet'],
+            cfg['ascending'], cfg['epsilon'], cfg['output_sheet'],
         )
 
         n_samples = results['n_samples']

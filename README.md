@@ -47,7 +47,6 @@ Labels are read from the `IsolationForest` / `Forecast` sheets in `PyexcelSettin
 | Monte Carlo Samples | `--monte-carlo-samples` | `0` |
 | Ascending | `--ascending` | `False` |
 | Epsilon | `--epsilon` | `False` |
-| Cumulative Sheets | `--cumulative` | `False` |
 | Output Sheet | `--output-sheet` | `AnomalyScores` |
 
 **Forecast**
@@ -75,7 +74,7 @@ Labels are read from the `IsolationForest` / `Forecast` sheets in `PyexcelSettin
 
 - Unsupervised anomaly scoring over one or more sheets, using scikit-learn's IsolationForest.
 - Output sheet columns: `Source Sheet`, `Index`, the numeric feature columns, `Anomaly Score`, `Is Anomaly`.
-- `Cumulative Sheets` (when scoring more than one sheet): sheet *k* is fit on sheets 1..*k* only, with no lookahead into later sheets; contamination is held constant across all sheets.
+- Multiple sheets are pooled into a single fit; all sheets must share the same numeric columns.
 - `Monte Carlo Samples` > 0 replaces the single fit with stationary-bootstrap resampling, averaging scores across iterations.
 
 ## TabPFN forecast
