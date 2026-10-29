@@ -1,0 +1,5 @@
+# Transaction exports carry cardholder names, emails, and card digits.
+*.xlsx
+*.csv
+__pycache__/
+.DS_Store
