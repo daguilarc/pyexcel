@@ -9,13 +9,19 @@ Python 3, pandas, and openpyxl, which pandas uses to read and write .xlsx
 files.
 
 ```
-python3 -m pip install pandas openpyxl
+python3 -m venv .venv-divvy
+source .venv-divvy/bin/activate
+python -m pip install -r divvy_xlsx/requirements.txt
 ```
+
+Run these install commands from the repository folder. On Windows activate with
+`.venv-divvy\Scripts\activate`. This environment is independent of forecasting;
+no conda or Excel installation is required.
 
 ## Usage
 
 ```
-python3 divvy_cleanup.py
+python3 divvy_xlsx/divvy_cleanup.py
 ```
 
 The script asks for the path to the `.xlsx`. A bare filename is looked up in

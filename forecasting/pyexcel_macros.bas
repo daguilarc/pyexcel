@@ -13,7 +13,7 @@ Option Explicit
 ' Usage: Alt+F11 -> File -> Import File -> select this .bas file.
 ' Then Alt+F8 -> RunForecast.
 
-' Full path to the folder containing tabpfn_forecast.py, e.g. "C:\Users\you\pyexcel". Leave empty ("") to
+' Full path to the folder containing tabpfn_forecast.py, e.g. "C:\Users\you\pyexcel\forecasting". Leave empty ("") to
 ' rely on the xlwings PYTHONPATH setting instead.
 Const SCRIPT_DIR As String = ""
 
