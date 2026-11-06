@@ -5,7 +5,7 @@ spreadsheet is easier to read for me (Diego).
 
 ## Requirements
 
-Python 3, pandas, and openpyxl, which pandas uses to read and write .xlsx
+Python 3, pandas, and openpyxl, which pandas uses to read and write Excel `.xlsx`
 files.
 
 ```
@@ -16,7 +16,7 @@ python -m pip install -r divvy_xlsx/requirements.txt
 
 Run these install commands from the repository folder. On Windows activate with
 `.venv-divvy\Scripts\activate`. This environment is independent of forecasting;
-no conda or Excel installation is required.
+neither conda nor Microsoft Excel needs to be installed.
 
 ## Usage
 

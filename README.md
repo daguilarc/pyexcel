@@ -6,7 +6,7 @@
 
 ## Divvy/Bill cleanup
 
-[Divvy cleanup](divvy_xlsx/README.md) removes unwanted transaction-export columns, sorts oldest first, and writes a cleaned copy. It needs Python with pandas/openpyxl and does not require Excel. Its dependencies and environment are separate from forecasting.
+[Divvy cleanup](divvy_xlsx/README.md) removes unwanted transaction-export columns, sorts oldest first, and writes a cleaned copy. It reads and writes Excel `.xlsx` files using Python with pandas/openpyxl. Microsoft Excel does not need to be installed. Its dependencies and environment are separate from forecasting.
 
 ## License
 
